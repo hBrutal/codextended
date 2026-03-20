@@ -1175,6 +1175,16 @@ void ClientBegin(int clientNum) {
 	begin(clientNum);
 }
 
+// See https://github.com/ibuddieat/zk_libcod/blob/dff123fad25d7b46d65685e9bca2111c8946a36e/code/libcod.cpp#L3600
+void SV_WriteDownloadErrorToClient(client_t *cl, msg_t *msg, char *errorMessage)
+{
+    MSG_WriteByte(msg, svc_download);
+    MSG_WriteShort(msg, 0);
+    MSG_WriteLong(msg, -1);
+    MSG_WriteString(msg, errorMessage);
+    *cl->downloadName = 0;
+}
+
 void custom_SV_WriteDownloadToClient(client_t *cl, msg_t *msg)
 {
     int curindex;
