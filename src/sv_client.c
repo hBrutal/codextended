@@ -28,6 +28,9 @@ void (*MSG_WriteShort)(msg_t*,int) = (void(*)(msg_t*,int))0x807F0BC;
 void (*MSG_WriteBigString)(msg_t*,const char*) = (void(*)(msg_t*,const char*))0x807A758;
 void (*SV_SendMessageToClient)(msg_t*,client_t*) = (void(*)(msg_t*,client_t*))0x808F680;
 void (*SV_SendClientGameState)(client_t*) = (void(*)(client_t*))0x8085EEC;
+static int (*MSG_ReadBitsCompress)(msg_t*, byte*, int) = (int(*)(msg_t*, byte*, int))0x807F23C;
+static int (*MSG_ReadBits)(msg_t*, int) = (int(*)(msg_t*, int))0x807F18C;
+static void (*SV_UserMove)(client_t*, msg_t*, qboolean) = (void(*)(client_t*, msg_t*, qboolean))0x8086fa4; 
 SV_Netchan_Transmit_t SV_Netchan_Transmit = (SV_Netchan_Transmit_t)0x0808dc74;
 SV_Netchan_TransmitNextFragment_t SV_Netchan_TransmitNextFragment = (SV_Netchan_TransmitNextFragment_t)0x0808dcf8;
 Sys_IsLANAddress_t Sys_IsLANAddress = (Sys_IsLANAddress_t)0x080c72f8;
@@ -189,11 +192,11 @@ void SanitizeString( char *in, char *out ) {
 }
 
 bool is_good_string(char* str) {
-	int i;
-	for(i = 0; i < strlen(str); i++)
-		if(str[i] < 32 || str[i] > 126)
-			return 0;
-	return 1;
+    int len = strlen(str);
+    for(int i = 0; i < len; i++)
+        if(str[i] < 32 || str[i] > 126)
+            return 0;
+    return 1;
 }
 
 void SV_XAuthorize(netadr_t from) {
@@ -308,7 +311,9 @@ static time_t connect_t = 0;
 void SV_SendDownloadDone(client_t *cl) { //let's fake that the downloads are done so it'll reload the file system
 	byte msg_buf[16384];
 	msg_t msg;
-	
+	byte compressBuf[MAX_MSGLEN];
+	int compressedSize;
+
 	MSG_Init( &msg, msg_buf, sizeof( msg_buf ) );
 	
 	MSG_WriteLong( &msg, cl->lastClientCommand );
@@ -333,8 +338,12 @@ void SV_SendDownloadDone(client_t *cl) { //let's fake that the downloads are don
 	MSG_WriteShort(&msg, 1);
 	MSG_WriteBigString(&msg, systeminfo);
 	MSG_WriteByte(&msg,svc_EOF); //end?
-	
-	SV_SendMessageToClient(&msg, cl);
+
+	memcpy(compressBuf, msg.data, 4);
+	compressedSize = MSG_WriteBitsCompress(msg.data + 4, compressBuf + 4, msg.cursize - 4) + 4;
+	SV_Netchan_Transmit(cl, compressBuf, compressedSize);
+
+	cl->nextSnapshotTime = svs.time - 1;
 }
 
 client_t *last_cl = NULL;
@@ -431,17 +440,13 @@ void Info_SetValueForKey_Big( char *s, const char *key, const char *value ) {
 
 void custom_SV_ExecuteClientMessage(client_t *cl, msg_t *msg)
 {
-		int* cl_serverId = (int*)((int)cl + 370936);
-	int* sv_serverId = (int*)0x80e30c0;
-	int* cl_messageAcknowledge = (int*)((int)cl + 67096);
+    static byte msgBuf[16384];
+    static msg_t decompressMsg;
+    int c;
 
-	int (*MSG_ReadBitsCompress)(msg_t*, byte*, int) = (int(*)(msg_t*, byte*, int))0x807F23C;
-	int (*MSG_ReadBits)(msg_t*, int) = (int(*)(msg_t*, int))0x807F18C;
-	void (*SV_UserMove)(client_t*, msg_t*, qboolean) = (void(*)(client_t*, msg_t*, qboolean))0x8086fa4;
-
-	byte msgBuf[16384];
-	msg_t decompressMsg;
-	int c;
+    int* cl_serverId = (int*)((int)cl + 370936);
+    int* sv_serverId = (int*)0x80e30c0;
+    int* cl_messageAcknowledge = (int*)((int)cl + 67096);
 
 	MSG_Init(&decompressMsg, msgBuf, sizeof(msgBuf));
 	decompressMsg.cursize = MSG_ReadBitsCompress(&msg->data[msg->readcount], msgBuf, msg->cursize - msg->readcount);
@@ -751,7 +756,7 @@ void SV_DirectConnect( netadr_t from ) {
 	clientNum = newcl - *clients;
 	memset(&xclients[clientNum], 0, sizeof(xclient_t));
 	if(from.type != NA_BOT)
-		Q_strncpyz(xclients[clientNum].mUID, x_challenges[i_challenge].mUID, sizeof(xclients[clientNum])); //copy mUID from challenge to xclients
+		Q_strncpyz(xclients[clientNum].mUID, x_challenges[i_challenge].mUID, sizeof(xclients[clientNum].mUID)); //copy mUID from challenge to xclients
 	
 	newcl->gentity = (unsigned)SV_GentityNum(clientNum);
 	unsigned short (*Scr_AllocArray)() = (unsigned short(*)())0x80A2610;
@@ -793,12 +798,12 @@ void SV_GetChallenge(netadr_t *from) {
 	// Prevent using getchallenge as an amplifier
 	if (SVC_RateLimitAddress(*from, 10, 1000)) {
 		Com_DPrintf("SV_GetChallenge: rate limit from %s exceeded, dropping request\n", NET_AdrToString(*from));
-		return 0;
+		return;
 	}
 	// Allow getchallenge to be DoSed relatively easily, but prevent excess outbound bandwidth usage when being flooded inbound
 	if (SVC_RateLimit(&outboundLeakyBucket, 10, 100)) {
 		Com_DPrintf("SV_GetChallenge: rate limit exceeded, dropping request\n");
-		return 0;
+		return;
 	}
 
 	int i, oldest, oldestTime;
@@ -908,7 +913,8 @@ void SV_UserinfoChanged( client_t* cl ) {
 	
 	j = 0;
 	
-	for(i = 0; i < strlen(request_name); i++) {
+	int len = strlen(request_name);
+	for(i = 0; i < len; i++) {
 		if(i >= 31)
 			break;
 		if(request_name[i] < 32 || request_name[i] > 126)
@@ -966,10 +972,11 @@ void hG_Say(gentity_t *ent, gentity_t *target, int mode, const char *msg) {
 
 	char line[1024] = {0};
 	int i,j;
-	
+	int len = strlen(msg);
+
 	j = 0;
 	
-	for(i = 0; i < strlen(msg); i++) {
+	for(i = 0; i < len; i++) {
 		if(i >= 1023)
 			break;
 		if(msg[i] < 32 || msg[i] > 126)
@@ -1026,7 +1033,7 @@ int QDECL SV_ClientCommand(client_t *cl, msg_t *msg) {
 	if(!strncmp("team", s, 4) || !strncmp("score", s, 5) || !strncmp("mr", s, 2))
 		floodprotect = qfalse;
 
-	if(cl->state >= CS_ACTIVE && svs_time < *(int*)(&cl->state + 68360) && floodprotect)
+	if(cl->state >= CS_ACTIVE && svs_time < *(int*)((int)&cl->state + 68360) && floodprotect)
 		clientOk = qfalse;
 
 	if(floodprotect)
@@ -1065,12 +1072,12 @@ int QDECL SV_ClientCommand(client_t *cl, msg_t *msg) {
 			if(!Q_stricmp(cmd, "follownext") || !Q_stricmp(cmd, "followprev") || !Q_stricmp(cmd, "gc"))
 				goto skip_vm_call;
 			
-			if(!Q_stricmp(cmd, "say_team") || !Q_stricmp(cmd, "say_team")) {
+			if(!Q_stricmp(cmd, "say") || !Q_stricmp(cmd, "say_team")) {
 				if(x_clients[clientNum].muted)
 					goto skip_vm_call;
 			}
 			
-			VM_Call(*(int*)0x80E30C4, 6, get_client_number( cl )); //works
+			VM_Call(*(int*)0x80E30C4, 6, clientNum); //works
 			//VM_Call(gvm, GAME_CLIENT_COMMAND, get_client_number( cl ));
 			//((int (*)(int,...))GAME("vmMain"))(6,get_client_number(cl));
 			//((void (QDECL *)(int))GAME("ClientCommand"))(get_client_number(cl));
@@ -1194,10 +1201,6 @@ void custom_SV_WriteDownloadToClient(client_t *cl, msg_t *msg)
 
     if(!*cl->downloadName)
         return;
-    
-    cl->state = CS_CONNECTED;
-    cl->rate = 25000;
-    cl->snapshotMsec = 50;
 
     if (!cl->download)
     {
@@ -1236,6 +1239,9 @@ void custom_SV_WriteDownloadToClient(client_t *cl, msg_t *msg)
         cl->downloadCurrentBlock = cl->downloadClientBlock = cl->downloadXmitBlock = 0;
         cl->downloadCount = 0;
         cl->downloadEOF = qfalse;
+		cl->state = CS_CONNECTED;
+		cl->rate = 25000;
+		cl->snapshotMsec = 50;
 
         if(sv_downloadNotifications->integer)
             SV_SendServerCommand(0, SV_CMD_CAN_IGNORE, "f \"%s^7 downloads %s\"", cl->name, cl->downloadName);
@@ -1314,7 +1320,7 @@ void custom_SV_WriteDownloadToClient(client_t *cl, msg_t *msg)
 
 // See https://github.com/voron00/CoD2rev_Server/blob/b012c4b45a25f7f80dc3f9044fe9ead6463cb5c6/src/server/sv_snapshot_mp.cpp#L686
 // FIXME: receiving as client_t* makes download slow
-static int SV_RateMsec(client_t client, int messageSize)
+static int SV_RateMsec(client_t *client, int messageSize)
 {
     int rate;
     int rateMsec;
@@ -1322,7 +1328,7 @@ static int SV_RateMsec(client_t client, int messageSize)
     if(messageSize > 1500)
         messageSize = 1500;
 
-    rate = client.rate;
+    rate = client->rate;
     if (sv_maxRate->integer)
     {
         if(sv_maxRate->integer < 1000)
@@ -1363,7 +1369,7 @@ void custom_SV_SendMessageToClient(msg_t *msg, client_t *client)
         return;
     }
 
-    rateMsec = SV_RateMsec(*client, compressedSize);
+    rateMsec = SV_RateMsec(client, compressedSize);
     if (rateMsec < client->snapshotMsec)
     {
         rateMsec = client->snapshotMsec;
@@ -1382,7 +1388,9 @@ void custom_SV_SendMessageToClient(msg_t *msg, client_t *client)
         }
     }
     sv.bpsTotalBytes += compressedSize;
+	sv.ubpsTotalBytes += msg->cursize; 
 }
+
 
 void custom_SV_SendClientMessages(void)
 {
@@ -1395,22 +1403,54 @@ void custom_SV_SendClientMessages(void)
 
     for (i = 0; i < sv_maxclients->integer; i++)
     {
-        cl = &svs.clients[i];
+        cl = getclient(i);
+
+        if (!cl->state)
+            continue;
+        if (svs.time < cl->nextSnapshotTime)
+            continue;
+
+        if (sv_fastDownload->integer && cl->download)
+            continue;
+
+        numclients++;
+
+        if (cl->netchan.unsentFragments)
+        {
+            cl->nextSnapshotTime = svs.time + SV_RateMsec(cl, cl->netchan.unsentLength - cl->netchan.unsentFragmentStart);
+            SV_Netchan_TransmitNextFragment(&cl->netchan);
+            continue;
+        }
+        SV_SendClientSnapshot(cl);
+    }
+
+    for (i = 0; i < sv_maxclients->integer; i++)
+    {
+        cl = getclient(i);
 
         if(!cl->state)
+            continue;
+        if(!cl->download)
             continue;
         if(svs.time < cl->nextSnapshotTime)
             continue;
 
         numclients++;
 
-        if (sv_fastDownload->integer && cl->download)
+        if (sv_fastDownload->integer)
         {
-            for (int j = 0; j < 1 + ((sv_fps->integer / 20) * MAX_DOWNLOAD_WINDOW); j++)
+            int maxIterations = 1 + ((sv_fps->integer / 20) * MAX_DOWNLOAD_WINDOW);
+            int startTime = Sys_Milliseconds();
+            int maxMsPerClient = 3;
+
+            for (int j = 0; j < maxIterations; j++)
             {
+                if (Sys_Milliseconds() - startTime > maxMsPerClient)
+                    break;
+
                 while (cl->netchan.unsentFragments)
                 {
-                    cl->nextSnapshotTime = svs.time + SV_RateMsec(*cl, cl->netchan.unsentLength - cl->netchan.unsentFragmentStart);
+                    cl->nextSnapshotTime = svs.time + SV_RateMsec(cl, cl->netchan.unsentLength - cl->netchan.unsentFragmentStart);
                     SV_Netchan_TransmitNextFragment(&cl->netchan);
                 }
                 SV_SendClientSnapshot(cl);
@@ -1420,7 +1460,7 @@ void custom_SV_SendClientMessages(void)
         {
             if (cl->netchan.unsentFragments)
             {
-                cl->nextSnapshotTime = svs.time + SV_RateMsec(*cl, cl->netchan.unsentLength - cl->netchan.unsentFragmentStart);
+                cl->nextSnapshotTime = svs.time + SV_RateMsec(cl, cl->netchan.unsentLength - cl->netchan.unsentFragmentStart);
                 SV_Netchan_TransmitNextFragment(&cl->netchan);
                 continue;
             }
